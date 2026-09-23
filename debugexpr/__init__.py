@@ -2,29 +2,39 @@
 
 Public API:
 
-* ``evaluate(ast, registers, memory)`` -> ``EvalResult``
+* ``evaluate(ast, registers, memory, *, on_budget_overrun=...)`` -> ``EvalResult``
 * AST nodes: Const, PtrConst, Reg, BinOp, Cmp, Cast, PtrAdd, PtrSub,
-  Load, Field, And, Or, Not
+  Load, Field, And, Or, Not, If
 * Types: IntType (or U8..U64 / S8..S64), POINTER, Pointer, Value
 * Memory: MemorySnapshot
-* Results: EvalResult, ReadInterval
-* Errors: EvalError and subclasses, each carrying a locatable ``path``
-* Limit: MAX_NODES
+* Results: EvalResult (status/results/errors/reads), ReadInterval
+* Errors: EvalError and subclasses (incl. PossibleError,
+  CandidateBudgetError), each carrying a locatable ``path``
+* Limits: MAX_NODES, MAX_REGISTER_CANDIDATES, MAX_CANDIDATE_COMBINATIONS
 """
 
 from .errors import (
+    CandidateBudgetError,
     DivisionByZeroError,
     EvalError,
     InputError,
     NodeBudgetError,
     PointerError,
+    PossibleError,
     RangeError,
     ShiftError,
     TypeMismatchError,
 )
-from .evaluator import MAX_NODES, EvalResult, ReadInterval, evaluate
+from .evaluator import (
+    MAX_CANDIDATE_COMBINATIONS,
+    MAX_NODES,
+    MAX_REGISTER_CANDIDATES,
+    EvalResult,
+    ReadInterval,
+    evaluate,
+)
 from .memory import MemorySnapshot
-from .nodes import And, BinOp, Cast, Cmp, Const, Field, Load, Node, Not, Or, PtrAdd, PtrConst, PtrSub, Reg
+from .nodes import And, BinOp, Cast, Cmp, Const, Field, If, Load, Node, Not, Or, PtrAdd, PtrConst, PtrSub, Reg
 from .types import (
     POINTER,
     S8,
@@ -44,6 +54,8 @@ from .types import (
 __all__ = [
     "evaluate",
     "MAX_NODES",
+    "MAX_REGISTER_CANDIDATES",
+    "MAX_CANDIDATE_COMBINATIONS",
     "EvalResult",
     "ReadInterval",
     "MemorySnapshot",
@@ -61,6 +73,7 @@ __all__ = [
     "And",
     "Or",
     "Not",
+    "If",
     "IntType",
     "PointerType",
     "POINTER",
@@ -82,4 +95,6 @@ __all__ = [
     "DivisionByZeroError",
     "PointerError",
     "NodeBudgetError",
+    "CandidateBudgetError",
+    "PossibleError",
 ]

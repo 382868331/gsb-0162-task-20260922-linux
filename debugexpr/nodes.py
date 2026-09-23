@@ -19,6 +19,9 @@ Load(ptr, int_type)               typed aligned load from a memory snapshot
 Field(ptr, offset, int_type)      load at ptr + offset (typed field access)
 And(left, right) / Or(left, right) short-circuit logic -> u8 0/1
 Not(node)                         logical negation -> u8 0/1
+If(cond, then, else_)             conditional: both branches are explored
+                                  only for the condition values that can
+                                  actually select them
 """
 
 from __future__ import annotations
@@ -115,4 +118,22 @@ class Not(Node):
     node: Node
 
 
-AnyNode = Union[Const, PtrConst, Reg, BinOp, Cmp, Cast, PtrAdd, PtrSub, Load, Field, And, Or, Not]
+@dataclass(frozen=True)
+class If(Node):
+    """Conditional expression.
+
+    ``cond`` must be an integer (0 = false, nonzero = true).  With
+    candidate registers the branch analysis is precise per condition
+    value: only the branch a given combination can actually take is
+    evaluated for it, so the *else* branch of an always-true condition
+    performs no reads and cannot raise.  When the condition is unknown
+    (both 0 and nonzero candidates) both branches are explored, each on
+    the combinations that reach it.
+    """
+
+    cond: Node
+    then: Node
+    else_: Node
+
+
+AnyNode = Union[Const, PtrConst, Reg, BinOp, Cmp, Cast, PtrAdd, PtrSub, Load, Field, And, Or, Not, If]

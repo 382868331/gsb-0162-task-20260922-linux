@@ -6,16 +6,30 @@ Semantics (fixed contract, see README):
 * Binary arithmetic requires *identical* operand types and truncates the
   result modulo 2**bits (wrap-around, no saturation, no silent widening).
 * ``div``/``mod`` truncate toward zero (C semantics); division by zero is
-  an error.  Signed overflow such as INT_MIN / -1 wraps per the modular
-  rule, like every other arithmetic result.
+  an error for the assignments that reach it.  Signed overflow such as
+  ``INT_MIN / -1`` wraps per the modular rule.
 * Shifts require 0 <= amount < bit width; ``shr`` is arithmetic for
   signed types and logical for unsigned types.
 * Comparisons honor signedness and require identical integer types.
   Pointer ``eq``/``ne`` work across regions; ordering comparisons and
   ``PtrSub`` require a single shared region.
-* ``and``/``or`` short-circuit: the right operand is not evaluated when
-  the left decides the result (so its side conditions, e.g. loads, never
-  trigger).
+* ``and``/``or`` short-circuit and ``If`` selects a branch: for each
+  concrete register assignment only the taken side is evaluated, so an
+  untaken branch performs no reads and cannot raise.  When the condition
+  is *unknown* (0 for some assignments, nonzero for others) both
+  branches are explored, each only for the assignments that reach it.
+* Registers may map to up to ``MAX_REGISTER_CANDIDATES`` candidate ints.
+  The expression is then evaluated exactly over the feasible
+  assignments: ``results`` is the set of distinct feasible values and
+  ``reads`` is the union of intervals that some feasible assignment
+  actually touches.  An error reached by some (but not all) assignments
+  yields ``status == "possible_error"`` with the located errors in
+  ``errors``; an error reached by every assignment is raised.
+* The concrete assignment space is bounded by
+  ``MAX_CANDIDATE_COMBINATIONS``.  Beyond it the result is
+  ``status == "unknown"`` (or ``CandidateBudgetError`` when the caller
+  passes ``on_budget_overrun="raise"``); static input legality is still
+  checked and illegal input still raises.
 * Loads are little-endian, must be naturally aligned, and may only touch
   regions of the snapshot passed to ``evaluate``.  Dereferencing the
   one-past-end position is rejected.
@@ -27,24 +41,29 @@ Every contract violation raises an ``EvalError`` subclass carrying a
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .errors import (
+    CandidateBudgetError,
     DivisionByZeroError,
     EvalError,
     InputError,
     NodeBudgetError,
     PointerError,
+    PossibleError,
     RangeError,
     ShiftError,
     TypeMismatchError,
 )
 from .memory import MemorySnapshot
-from .nodes import And, BinOp, Cast, Cmp, Const, Field, Load, Node, Not, Or, PtrAdd, PtrConst, PtrSub, Reg
+from .nodes import And, BinOp, Cast, Cmp, Const, Field, If, Load, Node, Not, Or, PtrAdd, PtrConst, PtrSub, Reg
 from .types import POINTER, IntType, Pointer, PointerType, S64, U8, Value
 
 MAX_NODES = 500
+MAX_REGISTER_CANDIDATES = 8
+MAX_CANDIDATE_COMBINATIONS = 64
 
 _INT_BINOPS = frozenset({"add", "sub", "mul", "div", "mod", "shl", "shr", "bitand", "bitor", "bitxor"})
 _SHIFT_OPS = frozenset({"shl", "shr"})
@@ -62,14 +81,37 @@ class ReadInterval:
 
 @dataclass(frozen=True)
 class EvalResult:
-    """Outcome of a successful evaluation.
+    """Outcome of evaluating an expression.
 
-    ``value`` is the typed result; ``reads`` lists every memory interval
-    actually read, in evaluation order (evaluation evidence).
+    Attributes:
+        status: one of
+            ``"exact"``          -- ``results`` lists every feasible value;
+            ``"possible_error"`` -- some assignments succeed (``results``),
+                                    others fail (``errors``);
+            ``"unknown"``        -- the feasible-assignment space exceeded
+                                    ``MAX_CANDIDATE_COMBINATIONS``; no values
+                                    or reads are claimed (both are empty).
+        results: distinct feasible typed values, deterministically ordered.
+        errors: located errors reached by some feasible assignment (each an
+            ``EvalError`` with its ``path``); empty for ``"exact"``.
+        reads: memory intervals actually read by some feasible assignment,
+            de-duplicated in a deterministic (evidence) order.
     """
 
-    value: Value
-    reads: tuple[ReadInterval, ...]
+    status: str
+    results: tuple[Value, ...] = ()
+    errors: tuple[EvalError, ...] = ()
+    reads: tuple[ReadInterval, ...] = ()
+
+    @property
+    def value(self) -> Value:
+        """Legacy accessor for expressions with a uniquely determined value."""
+        if self.status == "unknown" or len(self.results) != 1:
+            raise RuntimeError(
+                f"result is not uniquely determined (status={self.status}, "
+                f"{len(self.results)} feasible values); use .results"
+            )
+        return self.results[0]
 
 
 def _require_int(value: object, what: str, path: tuple[str, ...]) -> int:
@@ -115,6 +157,8 @@ def _count_nodes(root: Node) -> int:
 def _children(node: Node) -> tuple[Node, ...]:
     if isinstance(node, (BinOp, Cmp, PtrSub, And, Or)):
         return (node.left, node.right)
+    if isinstance(node, If):
+        return (node.cond, node.then, node.else_)
     if isinstance(node, PtrAdd):
         return (node.ptr, node.index)
     if isinstance(node, (Cast, Not)):
@@ -122,6 +166,17 @@ def _children(node: Node) -> tuple[Node, ...]:
     if isinstance(node, (Load, Field)):
         return (node.ptr,)
     return ()
+
+
+def _referenced_registers(root: Node) -> frozenset[str]:
+    names: set[str] = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, Reg):
+            names.add(node.name)
+        stack.extend(_children(node))
+    return frozenset(names)
 
 
 def _check_int_operands(op: str, left: Value, right: Value, path: tuple[str, ...]) -> IntType:
@@ -364,42 +419,326 @@ def _eval(node: Node, ctx: _Ctx, path: tuple[str, ...]) -> Value:
         value = _eval(node.node, ctx, path + ("node",))
         return Value(U8, int(not _truth(value, "not", path + ("node",))))
 
+    if isinstance(node, If):
+        cond = _eval(node.cond, ctx, path + ("cond",))
+        # Only the selected branch is evaluated for this assignment; the
+        # other branch's reads and errors cannot occur here.
+        if _truth(cond, "if", path + ("cond",)):
+            return _eval(node.then, ctx, path + ("then",))
+        return _eval(node.else_, ctx, path + ("else_",))
+
     raise InputError(f"not an AST node: {node!r}", path)
 
 
-def evaluate(ast: Node, registers: Mapping[str, int], memory: MemorySnapshot) -> EvalResult:
+# ---------------------------------------------------------------------------
+# Candidate aggregation
+# ---------------------------------------------------------------------------
+
+
+def _value_key(value: Value):
+    data = value.data
+    if isinstance(data, Pointer):
+        return (1, data.region_id, data.offset)
+    return (0, str(value.type), data)
+
+
+def _dedup_errors(errors: list[EvalError]) -> tuple[EvalError, ...]:
+    seen: set[tuple] = set()
+    out: list[EvalError] = []
+    for err in errors:
+        key = (type(err), err.path, err.message)
+        if key not in seen:
+            seen.add(key)
+            out.append(err)
+    return tuple(out)
+
+
+def _dedup_reads(reads: list[ReadInterval]) -> tuple[ReadInterval, ...]:
+    seen: set[tuple] = set()
+    out: list[ReadInterval] = []
+    for read in reads:
+        key = (read.region_id, read.offset, read.length)
+        if key not in seen:
+            seen.add(key)
+            out.append(read)
+    return tuple(out)
+
+
+def _normalize_registers(
+    registers: Mapping[str, object],
+) -> dict[str, tuple[int, ...]]:
+    """Validate registers and return per-register candidate tuples.
+
+    A plain ``int`` means one candidate; a tuple/list of ints gives up to
+    ``MAX_REGISTER_CANDIDATES`` candidates (duplicates are removed,
+    first-occurrence order kept).
+    """
+    if not isinstance(registers, Mapping):
+        raise InputError(
+            f"registers must be a mapping of str -> int (or int tuple/list), "
+            f"got {type(registers).__name__}"
+        )
+    clean: dict[str, tuple[int, ...]] = {}
+    for name, value in registers.items():
+        if type(name) is not str or not name:
+            raise InputError(f"register name must be a non-empty str, got {name!r}")
+        if type(value) is tuple or type(value) is list:
+            candidates: list[int] = []
+            seen: set[int] = set()
+            for item in value:
+                item = _require_int(item, f"register {name!r} candidate", ())
+                if item not in seen:
+                    seen.add(item)
+                    candidates.append(item)
+            if not candidates:
+                raise InputError(f"register {name!r} candidate list must not be empty", ())
+            if len(candidates) > MAX_REGISTER_CANDIDATES:
+                raise InputError(
+                    f"register {name!r} has {len(candidates)} distinct candidates; "
+                    f"at most {MAX_REGISTER_CANDIDATES} are allowed",
+                    (),
+                )
+            clean[name] = tuple(candidates)
+        else:
+            clean[name] = (_require_int(value, f"register {name!r} value", ()),)
+    return clean
+
+
+def _run_worlds(
+    ast: Node,
+    candidates: Mapping[str, tuple[int, ...]],
+    memory: MemorySnapshot,
+) -> tuple[str, tuple[Value, ...], tuple[EvalError, ...], tuple[ReadInterval, ...]]:
+    """Exact evaluation: one scalar run per concrete register assignment.
+
+    Only registers referenced by the AST participate in the space.
+    """
+    referenced = _referenced_registers(ast)
+    names = sorted(name for name in candidates if name in referenced)
+    pools = [candidates[name] for name in names]
+
+    values: dict[object, Value] = {}
+    errors: list[EvalError] = []
+    reads: list[ReadInterval] = []
+    for combo in itertools.product(*pools):
+        assignment = dict(zip(names, combo))
+        ctx = _Ctx(assignment, memory)
+        try:
+            result = _eval(ast, ctx, ())
+        except EvalError as err:
+            errors.append(err)
+        else:
+            values[_value_key(result)] = result
+        reads.extend(ctx.reads)
+
+    if not values:
+        # Every feasible assignment fails.  A uniform failure is a definite
+        # error; mixed failures are reported together as a possible error.
+        unique = _dedup_errors(errors)
+        if len(unique) == 1:
+            raise unique[0]
+        raise PossibleError(unique)
+
+    ordered_results = tuple(values[k] for k in sorted(values))
+    unique_errors = _dedup_errors(errors)
+    status = "possible_error" if unique_errors else "exact"
+    return status, ordered_results, unique_errors, _dedup_reads(reads)
+
+
+# ---------------------------------------------------------------------------
+# Structural validation used when the assignment space is over budget.
+# ---------------------------------------------------------------------------
+#
+# Only assignment-independent legality is enforced here: node field kinds,
+# operator names, IntType annotations, int-ness of literal integers,
+# register/region existence and literal pointer bounds (PtrConst is a
+# literal, so an out-of-region one is illegal input regardless of the
+# assignment).  Everything that depends on the concrete register values
+# (range, division by zero, dynamic pointer bounds, alignment, types
+# implied by a selected branch) is conservatively left unclaimed: the
+# result is "unknown" by contract.
+
+
+def _static_validate(
+    node: Node,
+    memory: MemorySnapshot,
+    candidates: Mapping[str, tuple[int, ...]],
+    path: tuple[str, ...],
+) -> None:
+    if isinstance(node, Const):
+        if not isinstance(node.type, IntType):
+            raise InputError(f"Const type must be an IntType, got {node.type!r}", path)
+        value = _require_int(node.value, "Const value", path)
+        if not node.type.contains(value):
+            raise RangeError(
+                f"literal {value} does not fit {node.type} [{node.type.min}, {node.type.max}]", path
+            )
+        return
+
+    if isinstance(node, PtrConst):
+        if type(node.region_id) is not str or not node.region_id:
+            raise InputError(f"PtrConst region_id must be a non-empty str, got {node.region_id!r}", path)
+        offset = _require_int(node.offset, "PtrConst offset", path)
+        _check_pointer_bounds(memory, Pointer(node.region_id, offset), path)
+        return
+
+    if isinstance(node, Reg):
+        if type(node.name) is not str or not node.name:
+            raise InputError(f"Reg name must be a non-empty str, got {node.name!r}", path)
+        if not isinstance(node.type, IntType):
+            raise InputError(f"Reg type must be an IntType, got {node.type!r}", path)
+        if node.name not in candidates:
+            raise InputError(f"unknown register {node.name!r}", path)
+        # Whether a candidate fits this Reg node's declared type is
+        # assignment-dependent (a per-world RangeError); it cannot be
+        # decided in the over-budget path, so it is left to "unknown".
+        return
+
+    if isinstance(node, BinOp):
+        if node.op not in _INT_BINOPS:
+            raise InputError(f"unknown binary operator {node.op!r}", path)
+        _static_validate(node.left, memory, candidates, path + ("left",))
+        _static_validate(node.right, memory, candidates, path + ("right",))
+        return
+
+    if isinstance(node, Cmp):
+        if node.op not in _CMP_OPS:
+            raise InputError(f"unknown comparison operator {node.op!r}", path)
+        _static_validate(node.left, memory, candidates, path + ("left",))
+        _static_validate(node.right, memory, candidates, path + ("right",))
+        return
+
+    if isinstance(node, Cast):
+        if not isinstance(node.target, IntType):
+            raise InputError(f"Cast target must be an IntType, got {node.target!r}", path)
+        _static_validate(node.node, memory, candidates, path + ("node",))
+        return
+
+    if isinstance(node, PtrAdd):
+        _static_validate(node.ptr, memory, candidates, path + ("ptr",))
+        _static_validate(node.index, memory, candidates, path + ("index",))
+        return
+
+    if isinstance(node, PtrSub):
+        _static_validate(node.left, memory, candidates, path + ("left",))
+        _static_validate(node.right, memory, candidates, path + ("right",))
+        return
+
+    if isinstance(node, Load):
+        if not isinstance(node.type, IntType):
+            raise InputError(f"Load type must be an IntType, got {node.type!r}", path)
+        _static_validate(node.ptr, memory, candidates, path + ("ptr",))
+        return
+
+    if isinstance(node, Field):
+        if not isinstance(node.type, IntType):
+            raise InputError(f"Field type must be an IntType, got {node.type!r}", path)
+        _require_int(node.offset, "Field offset", path)
+        _static_validate(node.ptr, memory, candidates, path + ("ptr",))
+        return
+
+    if isinstance(node, (And, Or)):
+        _static_validate(node.left, memory, candidates, path + ("left",))
+        # Constant left values statically decide the short-circuit, so the
+        # unevaluated right side is skipped (same laziness as scalar runs).
+        is_and = isinstance(node, And)
+        if isinstance(node.left, Const):
+            left_true = node.left.value != 0
+            right_runs = (not left_true) if is_and else left_true
+            if right_runs:
+                _static_validate(node.right, memory, candidates, path + ("right",))
+        else:
+            _static_validate(node.right, memory, candidates, path + ("right",))
+        return
+
+    if isinstance(node, Not):
+        _static_validate(node.node, memory, candidates, path + ("node",))
+        return
+
+    if isinstance(node, If):
+        _static_validate(node.cond, memory, candidates, path + ("cond",))
+        # Mirror the scalar engine's laziness for constant conditions;
+        # for non-constant conditions both branches may be reached, so
+        # both are checked (a malformed reachable branch is illegal input).
+        if isinstance(node.cond, Const):
+            if node.cond.value != 0:
+                _static_validate(node.then, memory, candidates, path + ("then",))
+            else:
+                _static_validate(node.else_, memory, candidates, path + ("else_",))
+        else:
+            _static_validate(node.then, memory, candidates, path + ("then",))
+            _static_validate(node.else_, memory, candidates, path + ("else_",))
+        return
+
+    raise InputError(f"not an AST node: {node!r}", path)
+
+
+def evaluate(
+    ast: Node,
+    registers: Mapping[str, object],
+    memory: MemorySnapshot,
+    *,
+    on_budget_overrun: str = "unknown",
+) -> EvalResult:
     """Evaluate ``ast`` against ``registers`` and the ``memory`` snapshot.
 
     Args:
         ast: an AST built from the node classes in ``debugexpr.nodes``
             (at most ``MAX_NODES`` distinct nodes).
-        registers: mapping of register name -> Python int.  bool and float
-            values (including NaN/Infinity) are rejected.
+        registers: mapping of register name -> Python int, or -> tuple/list
+            of up to ``MAX_REGISTER_CANDIDATES`` distinct ints.  bool and
+            float values (including NaN/Infinity) are rejected.
         memory: a ``MemorySnapshot``; loads may only touch its regions.
+        on_budget_overrun: ``"unknown"`` (default) returns
+            ``EvalResult(status="unknown")`` when the feasible assignment
+            space exceeds ``MAX_CANDIDATE_COMBINATIONS``; ``"raise"``
+            raises ``CandidateBudgetError`` instead.
 
     Returns:
-        ``EvalResult`` with the typed value and the list of memory
-        intervals actually read.
+        ``EvalResult`` with ``status`` / ``results`` / ``errors`` /
+        ``reads``.
 
     Raises:
-        EvalError: (subclass) any contract violation, with a locatable path.
+        EvalError: a definite (all-assignment or assignment-independent)
+            contract violation, with a locatable path.  Failures reached
+            by only some assignments are collected in ``result.errors``
+            (``status="possible_error"``); when no assignment succeeds,
+            the uniform error is raised (or :class:`PossibleError` for
+            non-uniform failures).
     """
     if not isinstance(ast, Node):
         raise InputError(f"ast must be a debugexpr Node, got {ast!r}")
-    if not isinstance(registers, Mapping):
-        raise InputError(f"registers must be a mapping of str -> int, got {type(registers).__name__}")
-    clean_registers: dict[str, int] = {}
-    for name, value in registers.items():
-        if type(name) is not str or not name:
-            raise InputError(f"register name must be a non-empty str, got {name!r}")
-        clean_registers[name] = _require_int(value, f"register {name!r} value", ())
+    if on_budget_overrun not in ("unknown", "raise"):
+        raise InputError(
+            f"on_budget_overrun must be 'unknown' or 'raise', got {on_budget_overrun!r}"
+        )
     if not isinstance(memory, MemorySnapshot):
         raise InputError(f"memory must be a MemorySnapshot, got {type(memory).__name__}")
+    candidates = _normalize_registers(registers)
 
     count = _count_nodes(ast)
     if count > MAX_NODES:
         raise NodeBudgetError(f"AST has {count} distinct nodes, exceeding the limit of {MAX_NODES}")
 
-    ctx = _Ctx(clean_registers, memory)
-    value = _eval(ast, ctx, ())
-    return EvalResult(value=value, reads=tuple(ctx.reads))
+    referenced = _referenced_registers(ast)
+    missing = referenced - candidates.keys()
+    if missing:
+        raise InputError(f"unknown register {sorted(missing)[0]!r}")
+    total = 1
+    for name in referenced:
+        total *= len(candidates[name])
+
+    if total <= MAX_CANDIDATE_COMBINATIONS:
+        status, results, errors, reads = _run_worlds(ast, candidates, memory)
+    elif on_budget_overrun == "raise":
+        raise CandidateBudgetError(
+            f"register assignment space has {total} combinations, exceeding the budget "
+            f"of {MAX_CANDIDATE_COMBINATIONS}"
+        )
+    else:
+        # Definite, assignment-independent legality is still enforced;
+        # dynamic outcomes are not claimed.
+        _static_validate(ast, memory, candidates, ())
+        status, results, errors, reads = "unknown", (), (), ()
+
+    return EvalResult(status=status, results=results, errors=errors, reads=reads)

@@ -66,3 +66,31 @@ class PointerError(EvalError):
 
 class NodeBudgetError(EvalError):
     """The AST exceeds the maximum allowed node count."""
+
+
+class CandidateBudgetError(EvalError):
+    """The cross product of register candidate values exceeds the budget.
+
+    Raised only when the caller requests exhaustive candidate tracking
+    (``mode="exhaustive"``).  In the default mode the affected result is
+    reported as ``unknown`` instead.
+    """
+
+
+class PossibleError(EvalError):
+    """An error that occurs for *some* but not all register assignments.
+
+    Wraps one or more concrete :class:`EvalError` instances observed while
+    evaluating feasible candidate combinations.  Other combinations may
+    yield ordinary values, so the caller must treat the expression as
+    "may succeed / may fail".
+    """
+
+    def __init__(self, errors: tuple[EvalError, ...]) -> None:
+        self.errors = tuple(errors)
+        kinds = ", ".join(sorted({type(e).__name__ for e in self.errors}))
+        super().__init__(
+            f"error possible for some register assignments ({kinds}); "
+            f"see the .errors attribute for the located errors",
+            (),
+        )
