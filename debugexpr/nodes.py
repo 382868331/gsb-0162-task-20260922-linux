@@ -19,6 +19,8 @@ Load(ptr, int_type)               typed aligned load from a memory snapshot
 Field(ptr, offset, int_type)      load at ptr + offset (typed field access)
 And(left, right) / Or(left, right) short-circuit logic -> u8 0/1
 Not(node)                         logical negation -> u8 0/1
+Select(cond, then, else_)         conditional value; only the reachable
+                                  branch is read for a determined cond
 """
 
 from __future__ import annotations
@@ -115,4 +117,21 @@ class Not(Node):
     node: Node
 
 
-AnyNode = Union[Const, PtrConst, Reg, BinOp, Cmp, Cast, PtrAdd, PtrSub, Load, Field, And, Or, Not]
+@dataclass(frozen=True)
+class Select(Node):
+    """Conditional expression ``then if cond else else_``.
+
+    ``cond`` must be an integer-valued node.  It is interpreted strictly:
+    only the exact values 0 and 1 are allowed; any other possible value
+    raises ``RangeError``.  When the condition is determined, only the
+    selected branch is evaluated (its loads, divisions and pointer checks
+    are path-sensitive evidence).  When the condition may be either 0 or
+    1, both branches are evaluated and their possible values are unioned.
+    """
+
+    cond: Node
+    then: Node
+    else_: Node
+
+
+AnyNode = Union[Const, PtrConst, Reg, BinOp, Cmp, Cast, PtrAdd, PtrSub, Load, Field, And, Or, Not, Select]

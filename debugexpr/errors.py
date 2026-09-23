@@ -66,3 +66,15 @@ class PointerError(EvalError):
 
 class NodeBudgetError(EvalError):
     """The AST exceeds the maximum allowed node count."""
+
+
+class CandidateBudgetError(EvalError):
+    """Candidate expansion exceeded the combination budget ("unknown").
+
+    Unlike every other ``EvalError`` this does *not* mean the input was
+    illegal: the expression was well formed, but its possible values could
+    not be enumerated within ``max_combinations`` (or within the 8-value
+    representation limit).  Callers are expected to treat it as an
+    explicit "unknown" result rather than a bug.  It is never raised on
+    expressions whose registers all hold single values.
+    """
