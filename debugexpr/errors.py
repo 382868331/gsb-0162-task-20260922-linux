@@ -66,3 +66,12 @@ class PointerError(EvalError):
 
 class NodeBudgetError(EvalError):
     """The AST exceeds the maximum allowed node count."""
+
+
+class TransactionError(EvalError):
+    """Edit-transaction state violation.
+
+    Raised when an operation is attempted on a transaction that is no
+    longer open (already committed, discarded, or rolled back after a
+    failed step).  Transactions are one-shot: they cannot be reused.
+    """

@@ -5,6 +5,11 @@ expression, prints the typed value together with the memory intervals
 actually read (evaluation evidence), then triggers one genuine rejection
 (a one-past-end dereference) and prints the located error.
 
+The second half demonstrates the one-shot edit transaction: typed stores
+are staged on top of the snapshot, expressions read the pending values,
+and the caller commits; then a failing transaction rolls back and shows
+its access trace while the caller's snapshot stays untouched.
+
 Run:  python demo.py
 """
 
@@ -15,12 +20,15 @@ from debugexpr import (
     Field,
     Load,
     MemorySnapshot,
+    Pointer,
     PtrAdd,
     PtrConst,
     Reg,
+    Store,
     S16,
     S32,
     U8,
+    begin_edit,
     evaluate,
 )
 
@@ -66,6 +74,42 @@ def main() -> None:
     except EvalError as err:
         print(f"rejected   : {type(err).__name__}: {err}")
         print(f"error path : {err.path!r} (locates the failing AST node)")
+
+    print()
+    print("== edit transaction: preview, then commit ==")
+    txn = begin_edit(memory)
+    txn.store(Store(Pointer("stack", 16), S32, -7))  # overwrite the s32 field
+    txn.store(Store(Pointer("stack", 17), U8, 0x01))  # overlapping u8 on top
+    preview = txn.evaluate(Load(PtrConst("stack", 16), S32))
+    print(f"staged     : store<s32>(stack+16, -7); store<u8>(stack+17, 0x01)")
+    print(f"preview    : load<s32>(stack+16) = {preview.value.data} (pending write visible)")
+    print("access trace so far:")
+    for rec in txn.trace:
+        print(f"  {rec.kind:5s} region={rec.region_id!r} offset={rec.offset} length={rec.length}")
+    committed = txn.commit()
+    print(f"committed  : new snapshot bytes[16:20] = {committed.read('stack', 16, 4).hex()}")
+    print(f"original   : caller snapshot bytes[16:20] = {memory.read('stack', 16, 4).hex()} (untouched)")
+
+    print()
+    print("== edit transaction: write, read, fail -> rollback ==")
+    txn2 = begin_edit(memory)
+    txn2.store(Store(Pointer("stack", 32), S16, 999))
+    seen = txn2.evaluate(Load(PtrConst("stack", 32), S16))
+    print(f"staged     : store<s16>(stack+32, 999); preview read back {seen.value.data}")
+    try:
+        txn2.store(Store(Pointer("stack", 64), U8, 1))  # one-past-end: rejected
+    except EvalError as err:
+        print(f"rejected   : {type(err).__name__}: {err}")
+    print(f"state      : {txn2.state} (whole transaction rolled back)")
+    print("access trace of what was attempted:")
+    for rec in txn2.trace:
+        print(f"  {rec.kind:5s} region={rec.region_id!r} offset={rec.offset} length={rec.length}")
+    try:
+        txn2.commit()
+    except EvalError as err:
+        print(f"commit     : {type(err).__name__}: {err}")
+    after = evaluate(Load(PtrConst("stack", 32), S16), {}, memory)
+    print(f"original   : load<s16>(stack+32) on caller snapshot = {after.value.data} (no leak)")
 
 
 if __name__ == "__main__":
