@@ -8,6 +8,8 @@ Public API:
 * Types: IntType (or U8..U64 / S8..S64), POINTER, Pointer, Value
 * Memory: MemorySnapshot
 * Results: EvalResult, ReadInterval
+* Edit transactions: Store, AccessRecord, TransactionResult,
+  run_transaction, MAX_STATEMENTS
 * Errors: EvalError and subclasses, each carrying a locatable ``path``
 * Limit: MAX_NODES
 """
@@ -25,6 +27,7 @@ from .errors import (
 from .evaluator import MAX_NODES, EvalResult, ReadInterval, evaluate
 from .memory import MemorySnapshot
 from .nodes import And, BinOp, Cast, Cmp, Const, Field, Load, Node, Not, Or, PtrAdd, PtrConst, PtrSub, Reg
+from .transaction import MAX_STATEMENTS, AccessRecord, Store, TransactionResult, run_transaction
 from .types import (
     POINTER,
     S8,
@@ -47,6 +50,11 @@ __all__ = [
     "EvalResult",
     "ReadInterval",
     "MemorySnapshot",
+    "run_transaction",
+    "MAX_STATEMENTS",
+    "Store",
+    "AccessRecord",
+    "TransactionResult",
     "Node",
     "Const",
     "PtrConst",

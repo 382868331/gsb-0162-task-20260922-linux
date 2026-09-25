@@ -3,7 +3,10 @@
 Builds a fixed memory snapshot and registers, evaluates one real
 expression, prints the typed value together with the memory intervals
 actually read (evaluation evidence), then triggers one genuine rejection
-(a one-past-end dereference) and prints the located error.
+(a one-past-end dereference) and prints the located error.  A second
+section demonstrates a one-shot edit transaction: typed stores with
+read-your-writes, the access trace, a rollback on failure, and a commit
+that leaves the source snapshot untouched.
 
 Run:  python demo.py
 """
@@ -11,6 +14,7 @@ Run:  python demo.py
 from debugexpr import (
     BinOp,
     Cast,
+    Const,
     EvalError,
     Field,
     Load,
@@ -20,8 +24,11 @@ from debugexpr import (
     Reg,
     S16,
     S32,
+    Store,
     U8,
+    U32,
     evaluate,
+    run_transaction,
 )
 
 
@@ -66,6 +73,42 @@ def main() -> None:
     except EvalError as err:
         print(f"rejected   : {type(err).__name__}: {err}")
         print(f"error path : {err.path!r} (locates the failing AST node)")
+
+    print()
+    print("== edit transaction: rollback on failure ==")
+    # store u32 at stack+16, read its low byte back into stack+0, then a
+    # one-past-end store fails and rolls the whole transaction back.
+    txn = run_transaction(
+        [
+            Store(PtrConst("stack", 16), U32, Const(0x11223344, U32)),
+            Store(PtrConst("stack", 0), U8, Load(PtrConst("stack", 16), U8)),
+            Store(PtrConst("stack", 64), U8, Const(0x99, U8)),  # one-past-end
+        ],
+        registers,
+        memory,
+    )
+    print(f"ok         : {txn.ok}")
+    print(f"error      : {type(txn.error).__name__}: {txn.error}")
+    print("access trace attempted before the failure:")
+    for rec in txn.trace:
+        print(f"  {rec.kind:5s} region={rec.region_id!r} offset={rec.offset} length={rec.length}")
+    print(f"source snapshot still intact: {memory.read('stack', 0, 4).hex() == '00000000'}")
+
+    print()
+    print("== edit transaction: commit ==")
+    txn = run_transaction(
+        [
+            Store(PtrConst("stack", 16), U32, Const(0x11223344, U32)),
+            Store(PtrConst("stack", 0), U8, Load(PtrConst("stack", 16), U8)),
+        ],
+        registers,
+        memory,
+    )
+    print(f"ok         : {txn.ok}")
+    committed = txn.commit()
+    print(f"committed  : stack[0:4]  = {committed.read('stack', 0, 4).hex()} (read-your-writes byte 0x44)")
+    print(f"             stack[16:20]= {committed.read('stack', 16, 4).hex()}")
+    print(f"source snapshot unchanged : stack[0:4]={memory.read('stack', 0, 4).hex()}")
 
 
 if __name__ == "__main__":
