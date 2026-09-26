@@ -19,6 +19,9 @@ Load(ptr, int_type)               typed aligned load from a memory snapshot
 Field(ptr, offset, int_type)      load at ptr + offset (typed field access)
 And(left, right) / Or(left, right) short-circuit logic -> u8 0/1
 Not(node)                         logical negation -> u8 0/1
+FieldRef(base, layout, name)      lvalue field address per StructLayout (no read)
+IndexRef(base, layout, index)     lvalue element address per ArrayLayout (no read)
+Deref(ptr, layout)                final scalar fetch per IntLayout/PtrLayout
 """
 
 from __future__ import annotations
@@ -115,4 +118,45 @@ class Not(Node):
     node: Node
 
 
-AnyNode = Union[Const, PtrConst, Reg, BinOp, Cmp, Cast, PtrAdd, PtrSub, Load, Field, And, Or, Not]
+
+
+@dataclass(frozen=True)
+class FieldRef(Node):
+    """Lvalue field selection ``base.name`` per a caller-supplied StructLayout.
+
+    Produces the *address* of the field (a pointer); it never reads the
+    enclosing struct.  Use ``Deref`` to fetch the value.
+    """
+
+    base: Node
+    layout: object  # StructLayout, validated in evaluate
+    name: str
+
+
+@dataclass(frozen=True)
+class IndexRef(Node):
+    """Lvalue subscript ``base[index]`` per a caller-supplied ArrayLayout.
+
+    Produces the *address* of the element; the subscript is bounds-checked
+    against the layout length (empty arrays reject every index).
+    """
+
+    base: Node
+    layout: object  # ArrayLayout, validated in evaluate
+    index: Node
+
+
+@dataclass(frozen=True)
+class Deref(Node):
+    """Final value fetch: read exactly ``layout.size`` bytes at ``ptr``.
+
+    Only scalar layouts (IntLayout / PtrLayout) are dereferenceable.
+    Alignment is the layout's declared alignment, not the natural one.
+    """
+
+    ptr: Node
+    layout: object  # IntLayout | PtrLayout, validated in evaluate
+
+
+AnyNode = Union[Const, PtrConst, Reg, BinOp, Cmp, Cast, PtrAdd, PtrSub, Load, Field, And, Or, Not,
+           FieldRef, IndexRef, Deref]

@@ -4,7 +4,8 @@ Public API:
 
 * ``evaluate(ast, registers, memory)`` -> ``EvalResult``
 * AST nodes: Const, PtrConst, Reg, BinOp, Cmp, Cast, PtrAdd, PtrSub,
-  Load, Field, And, Or, Not
+  Load, Field, And, Or, Not, FieldRef, IndexRef, Deref
+* Layouts: IntLayout, PtrLayout, StructField, StructLayout, ArrayLayout
 * Types: IntType (or U8..U64 / S8..S64), POINTER, Pointer, Value
 * Memory: MemorySnapshot
 * Results: EvalResult, ReadInterval
@@ -23,8 +24,12 @@ from .errors import (
     TypeMismatchError,
 )
 from .evaluator import MAX_NODES, EvalResult, ReadInterval, evaluate
+from .layout import ArrayLayout, IntLayout, Layout, PtrLayout, StructField, StructLayout
 from .memory import MemorySnapshot
-from .nodes import And, BinOp, Cast, Cmp, Const, Field, Load, Node, Not, Or, PtrAdd, PtrConst, PtrSub, Reg
+from .nodes import (
+    And, BinOp, Cast, Cmp, Const, Deref, Field, FieldRef, IndexRef, Load,
+    Node, Not, Or, PtrAdd, PtrConst, PtrSub, Reg,
+)
 from .types import (
     POINTER,
     S8,
@@ -47,6 +52,12 @@ __all__ = [
     "EvalResult",
     "ReadInterval",
     "MemorySnapshot",
+    "Layout",
+    "IntLayout",
+    "PtrLayout",
+    "StructField",
+    "StructLayout",
+    "ArrayLayout",
     "Node",
     "Const",
     "PtrConst",
@@ -58,6 +69,9 @@ __all__ = [
     "PtrSub",
     "Load",
     "Field",
+    "FieldRef",
+    "IndexRef",
+    "Deref",
     "And",
     "Or",
     "Not",

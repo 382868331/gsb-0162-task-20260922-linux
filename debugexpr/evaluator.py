@@ -40,8 +40,12 @@ from .errors import (
     ShiftError,
     TypeMismatchError,
 )
+from .layout import ArrayLayout, IntLayout, PtrLayout, StructLayout
 from .memory import MemorySnapshot
-from .nodes import And, BinOp, Cast, Cmp, Const, Field, Load, Node, Not, Or, PtrAdd, PtrConst, PtrSub, Reg
+from .nodes import (
+    And, BinOp, Cast, Cmp, Const, Deref, Field, FieldRef, IndexRef, Load,
+    Node, Not, Or, PtrAdd, PtrConst, PtrSub, Reg,
+)
 from .types import POINTER, IntType, Pointer, PointerType, S64, U8, Value
 
 MAX_NODES = 500
@@ -119,8 +123,12 @@ def _children(node: Node) -> tuple[Node, ...]:
         return (node.ptr, node.index)
     if isinstance(node, (Cast, Not)):
         return (node.node,)
-    if isinstance(node, (Load, Field)):
+    if isinstance(node, (Load, Field, Deref)):
         return (node.ptr,)
+    if isinstance(node, FieldRef):
+        return (node.base,)
+    if isinstance(node, IndexRef):
+        return (node.base, node.index)
     return ()
 
 
@@ -235,6 +243,36 @@ def _do_load(ctx: _Ctx, ptr: Pointer, itype: IntType, path: tuple[str, ...]) -> 
     return Value(itype, int.from_bytes(raw, "little", signed=itype.signed))
 
 
+def _do_deref(ctx: _Ctx, ptr: Pointer, layout: IntLayout | PtrLayout, path: tuple[str, ...]) -> Value:
+    """Read exactly ``layout.size`` bytes at ``ptr`` per the caller's layout.
+
+    Alignment is the layout's declared alignment (packed/unaligned fields
+    declare ``align=1``); bounds follow the same region rules as ``Load``.
+    """
+    region_size = _check_pointer_bounds(ctx.memory, ptr, path)
+    size = layout.size
+    if ptr.offset % layout.align != 0:
+        raise PointerError(
+            f"misaligned access at offset {ptr.offset} in region {ptr.region_id!r} "
+            f"(layout declares {layout.align}-byte alignment)",
+            path,
+        )
+    if ptr.offset + size > region_size:
+        raise PointerError(
+            f"read of {size} bytes at offset {ptr.offset} in region {ptr.region_id!r} "
+            f"ends past the region size {region_size} "
+            f"(one-past-end dereference is rejected)",
+            path,
+        )
+    raw = ctx.memory.read(ptr.region_id, ptr.offset, size)
+    ctx.reads.append(ReadInterval(ptr.region_id, ptr.offset, size))
+    if isinstance(layout, IntLayout):
+        return Value(layout.int_type, int.from_bytes(raw, "little", signed=layout.int_type.signed))
+    target = Pointer(layout.target_region, int.from_bytes(raw, "little"))
+    _check_pointer_bounds(ctx.memory, target, path)  # cross-region target must exist and fit
+    return Value(POINTER, target)
+
+
 def _truth(value: Value, op: str, path: tuple[str, ...]) -> bool:
     if not isinstance(value.type, IntType):
         raise TypeMismatchError(f"{op}: operand must be an integer, got {value.type}", path)
@@ -345,6 +383,66 @@ def _eval(node: Node, ctx: _Ctx, path: tuple[str, ...]) -> Value:
         assert isinstance(base.data, Pointer)
         ptr = Pointer(base.data.region_id, base.data.offset + offset)
         return _do_load(ctx, ptr, node.type, path)
+
+
+    if isinstance(node, FieldRef):
+        if not isinstance(node.layout, StructLayout):
+            raise InputError(f"FieldRef layout must be a StructLayout, got {node.layout!r}", path)
+        if type(node.name) is not str or not node.name:
+            raise InputError(f"FieldRef name must be a non-empty str, got {node.name!r}", path)
+        base = _eval(node.base, ctx, path + ("base",))
+        if not isinstance(base.type, PointerType):
+            raise TypeMismatchError(
+                f"field-ref: base must be a pointer, got {base.type}", path + ("base",)
+            )
+        field = node.layout.field(node.name)
+        if field is None:
+            raise InputError(
+                f"struct layout has no field {node.name!r} "
+                f"(known: {[f.name for f in node.layout.fields]})",
+                path,
+            )
+        assert isinstance(base.data, Pointer)
+        ptr = Pointer(base.data.region_id, base.data.offset + field.offset)
+        _check_pointer_bounds(ctx.memory, ptr, path)
+        return Value(POINTER, ptr)  # lvalue: address only, nothing is read
+
+    if isinstance(node, IndexRef):
+        if not isinstance(node.layout, ArrayLayout):
+            raise InputError(f"IndexRef layout must be an ArrayLayout, got {node.layout!r}", path)
+        base = _eval(node.base, ctx, path + ("base",))
+        if not isinstance(base.type, PointerType):
+            raise TypeMismatchError(
+                f"index-ref: base must be a pointer, got {base.type}", path + ("base",)
+            )
+        index = _eval(node.index, ctx, path + ("index",))
+        if not isinstance(index.type, IntType):
+            raise TypeMismatchError(
+                f"index-ref: index must be an integer, got {index.type}", path + ("index",)
+            )
+        assert isinstance(base.data, Pointer) and isinstance(index.data, int)
+        if index.data < 0 or index.data >= node.layout.length:
+            raise PointerError(
+                f"subscript {index.data} is outside array of length {node.layout.length}"
+                + (" (empty array)" if node.layout.length == 0 else ""),
+                path + ("index",),
+            )
+        ptr = Pointer(base.data.region_id, base.data.offset + index.data * node.layout.element.size)
+        _check_pointer_bounds(ctx.memory, ptr, path)
+        return Value(POINTER, ptr)  # lvalue: address only, nothing is read
+
+    if isinstance(node, Deref):
+        if not isinstance(node.layout, (IntLayout, PtrLayout)):
+            raise InputError(
+                f"Deref layout must be an IntLayout or PtrLayout (scalar), got {node.layout!r}", path
+            )
+        ptr_value = _eval(node.ptr, ctx, path + ("ptr",))
+        if not isinstance(ptr_value.type, PointerType):
+            raise TypeMismatchError(
+                f"deref: operand must be a pointer, got {ptr_value.type}", path + ("ptr",)
+            )
+        assert isinstance(ptr_value.data, Pointer)
+        return _do_deref(ctx, ptr_value.data, node.layout, path)
 
     if isinstance(node, And):
         left = _eval(node.left, ctx, path + ("left",))

@@ -8,6 +8,16 @@
 * 核心算法（模截断算术、截断除法、指针边界/对齐检查）在本仓库内从零实现，
   未调用第三方同类实现。
 
+## 环境准备（隔离 venv）
+
+无需任何第三方依赖；venv 仅为隔离解释器：
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate          # 或直接使用 .venv/bin/python
+python -m unittest discover -s tests -v
+```
+
 ## 接口
 
 ```python
@@ -19,7 +29,8 @@ result.reads   # tuple[ReadInterval]：实际读取的内存区间（求值证�
 ```
 
 * `ast`：由 `debugexpr` 节点类构成的 AST：`Const / PtrConst / Reg / BinOp /
-  Cmp / Cast / PtrAdd / PtrSub / Load / Field / And / Or / Not`。
+  Cmp / Cast / PtrAdd / PtrSub / Load / Field / And / Or / Not`，以及布局导航
+  节点 `FieldRef / IndexRef / Deref`（见下节）。
 * `registers`：`dict[str, int]`，寄存器名到整数值。
 * `memory`：`MemorySnapshot({"region_id": b"..."})`，不可变区域快照；
   `Load`/`Field` 只能读取传入快照中的区域。
@@ -49,6 +60,62 @@ result.reads   # tuple[ReadInterval]：实际读取的内存区间（求值证�
   不会触发）。`Not` 逻辑取反。三者结果均为 `u8` 0/1。
 * 每次 `Load`/`Field` 向结果 `reads` 追加一条 `ReadInterval(region_id,
   offset, length)`。
+
+## 类型布局与结构化访问（p.field / a[index]）
+
+调用方提供一份**有限类型布局**（`debugexpr.layout`），表达式即可沿结构体
+字段和数组下标取值。布局完全由调用方给出——字段偏移、数组长度、元素类型
+及对齐——模块不猜测任何真实 C 编译器布局：
+
+```python
+from debugexpr import (
+    StructLayout, StructField, ArrayLayout, IntLayout, PtrLayout,
+    FieldRef, IndexRef, Deref, PtrConst, Const, U8, U16, U32,
+)
+
+point = StructLayout((
+    StructField("tag", 0, IntLayout(U8)),
+    StructField("code", 1, IntLayout(U32, align=1)),        # 未对齐（packed）字段
+    StructField("matrix", 8, ArrayLayout(ArrayLayout(IntLayout(U16), 3), 2)),
+    StructField("heap_obj", 24, PtrLayout("heap")),        # 指向另一区域的指针
+))
+
+# point.matrix[1][2]
+expr = Deref(
+    IndexRef(IndexRef(FieldRef(PtrConst("stack", 0), point, "matrix"),
+                      ArrayLayout(ArrayLayout(IntLayout(U16), 3), 2), Const(1, U8)),
+             ArrayLayout(IntLayout(U16), 3), Const(2, U8)),
+    IntLayout(U16),
+)
+```
+
+布局种类：`IntLayout(int_type, align)`（align 缺省为类型自然宽度）、
+`PtrLayout(target_region, align=8)`（8 字节小端偏移量，目标区域由布局指名）、
+`StructLayout(fields, align, union=False, size=None)`、
+`ArrayLayout(element, length, align)`（`length=0` 为空数组，合法）。
+
+语义要点：
+
+* **左值与值分离**：`FieldRef` / `IndexRef` 只计算字段/元素的*地址*，
+  本身不读取任何内存（`reads` 为空）；只有最终的 `Deref` 按布局读取
+  恰好 `layout.size` 个字节。读取证据（`result.reads`）可对照验证无关
+  字段从未被访问。
+* **对齐按布局声明**：`Deref` 检查 `offset % layout.align == 0`，因此
+  声明 `align=1` 的未对齐字段可以读取，而声明更大对齐的字段在错对齐
+  地址上仍被拒绝。
+* **越界下标带路径拒绝**：下标须满足 `0 <= index < length`（空数组拒绝
+  一切下标），违反抛 `PointerError`，`path` 定位到 `(..., "index")`。
+* **跨地址空间指针**：`PtrLayout` 解出 `(target_region, offset)` 后按原
+  地址空间规则校验——目标区域不存在或偏移越界时抛带 `path` 的
+  `PointerError`；合法时可直接继续 `FieldRef`/`IndexRef`/`Deref` 导航。
+* **重叠字段**：普通结构体重叠布局在定义时即被 `ValueError` 拒绝；
+  显式 `union=True` 允许重叠，表示对同一段字节的多种解释。
+* 布局定义错误（负偏移、负长度、非法对齐、字段重名等）在构造时抛
+  `ValueError`；求值期错误仍是带 `path` 的 `EvalError` 子类。
+
+原标量求值 API（`evaluate(ast, registers, memory)` 及全部既有节点）
+保持不变，新旧节点可在同一表达式中混用，节点预算 `MAX_NODES` 同样覆盖
+新节点。
 
 ## 错误语义
 
@@ -84,15 +151,22 @@ ShiftError / DivisionByZeroError / PointerError / NodeBudgetError`），均携�
 ## 已知限制
 
 * 无浮点、无数组/结构体字面量、无指针↔整数 cast、无变量赋值。
+* 布局导航只支持标量终值（`Deref` 仅接受 `IntLayout`/`PtrLayout`），
+  不整体读取结构体/数组；内存中的指针固定为 8 字节小端区域偏移量。
 * 区域为平坦字节序列，不支持权限位或空洞（gap）映射。
 * 寄存器值在 `Reg` 节点处按声明类型做范围检查，未提供寄存器类型推断。
 
 ## 验证命令
 
 ```bash
-python -m unittest discover -s tests -v   # 41 个测试
-python demo.py                            # 正常求值 + 读取证据 + 一次实际拒绝
+python -m unittest discover -s tests -v   # 61 个测试（41 个基线回归 + 20 个布局导航）
+python demo.py                            # 基线：正常求值 + 读取证据 + 一次实际拒绝
+python demo_iteration.py                  # 布局导航演示（真实离线计算，远低于 90 秒）
 ```
+
+`tests/test_layout.py` 中的期望地址与字节值由测试文件内的独立整数/切片
+参考计算给出（不调用被测核心的地址逻辑），并与实际读取日志逐条对照，
+证明无关字段未被读取。
 
 测试中的算术/比较/转型期望值由 `tests/reference.py` 的独立整数掩码参考
 实现给出（不导入被测核心），核心结果与之逐项交叉一致。
