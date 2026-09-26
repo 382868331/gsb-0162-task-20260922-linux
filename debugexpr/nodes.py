@@ -115,4 +115,39 @@ class Not(Node):
     node: Node
 
 
-AnyNode = Union[Const, PtrConst, Reg, BinOp, Cmp, Cast, PtrAdd, PtrSub, Load, Field, And, Or, Not]
+
+
+@dataclass(frozen=True)
+class FieldOf(Node):
+    """``base.field``: field selection on a struct/union at ``base``.
+
+    ``base`` evaluates to a pointer (or an aggregate lvalue address);
+    ``layout`` is the caller-supplied ``StructLayout`` describing it.
+    Selection itself only computes an address — bytes are read only for
+    scalar (IntType / POINTER) fields, never for the whole struct.
+    Aggregate-typed fields yield an lvalue usable by further
+    ``FieldOf``/``IndexOf``.
+    """
+
+    base: Node
+    layout: object  # StructLayout
+    field: str
+
+
+@dataclass(frozen=True)
+class IndexOf(Node):
+    """``base[index]``: subscript into an array at ``base``.
+
+    ``base`` evaluates to a pointer (or an aggregate lvalue address);
+    ``layout`` is the caller-supplied ``ArrayLayout``; ``index`` is an
+    integer-typed node.  Out-of-bounds indices (including any index into
+    an empty array) are rejected with a path.  Scalar elements are read
+    byte-exactly; aggregate elements yield an lvalue.
+    """
+
+    base: Node
+    layout: object  # ArrayLayout
+    index: Node
+
+
+AnyNode = Union[Const, PtrConst, Reg, BinOp, Cmp, Cast, PtrAdd, PtrSub, Load, Field, And, Or, Not, FieldOf, IndexOf]

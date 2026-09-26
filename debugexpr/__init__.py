@@ -8,6 +8,8 @@ Public API:
 * Types: IntType (or U8..U64 / S8..S64), POINTER, Pointer, Value
 * Memory: MemorySnapshot
 * Results: EvalResult, ReadInterval
+* Layouts: FieldInfo, StructLayout, ArrayLayout (caller-supplied, explicit)
+* Structured access: FieldOf (p.field), IndexOf (a[index]) with lvalues
 * Errors: EvalError and subclasses, each carrying a locatable ``path``
 * Limit: MAX_NODES
 """
@@ -22,9 +24,21 @@ from .errors import (
     ShiftError,
     TypeMismatchError,
 )
-from .evaluator import MAX_NODES, EvalResult, ReadInterval, evaluate
+from .evaluator import MAX_NODES, EvalResult, LValue, ReadInterval, evaluate
+from .layout import (
+    POINTER_SIZE,
+    ArrayLayout,
+    FieldInfo,
+    StructLayout,
+    decode_pointer,
+    encode_pointer,
+    layout_size,
+)
 from .memory import MemorySnapshot
-from .nodes import And, BinOp, Cast, Cmp, Const, Field, Load, Node, Not, Or, PtrAdd, PtrConst, PtrSub, Reg
+from .nodes import (
+    And, BinOp, Cast, Cmp, Const, Field, FieldOf, IndexOf, Load, Node, Not, Or,
+    PtrAdd, PtrConst, PtrSub, Reg,
+)
 from .types import (
     POINTER,
     S8,
@@ -58,6 +72,8 @@ __all__ = [
     "PtrSub",
     "Load",
     "Field",
+    "FieldOf",
+    "IndexOf",
     "And",
     "Or",
     "Not",
@@ -82,4 +98,12 @@ __all__ = [
     "DivisionByZeroError",
     "PointerError",
     "NodeBudgetError",
+    "LValue",
+    "POINTER_SIZE",
+    "FieldInfo",
+    "StructLayout",
+    "ArrayLayout",
+    "layout_size",
+    "encode_pointer",
+    "decode_pointer",
 ]
