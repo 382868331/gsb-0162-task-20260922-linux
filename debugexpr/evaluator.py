@@ -18,7 +18,11 @@ Semantics (fixed contract, see README):
   trigger).
 * Loads are little-endian, must be naturally aligned, and may only touch
   regions of the snapshot passed to ``evaluate``.  Dereferencing the
-  one-past-end position is rejected.
+  one-past-end position is rejected.  A region is a sparse, multi-segment
+  mapping with per-segment read permission: a load spanning several
+  adjacent readable segments succeeds (one read record per segment), while
+  touching an unmapped hole or a non-readable segment fails the *whole*
+  load atomically -- no half value and no partial read evidence.
 * The AST is limited to ``MAX_NODES`` distinct nodes.
 
 Every contract violation raises an ``EvalError`` subclass carrying a
@@ -39,8 +43,9 @@ from .errors import (
     RangeError,
     ShiftError,
     TypeMismatchError,
+    UnmappedAddressError,
 )
-from .memory import MemorySnapshot
+from .memory import MemorySnapshot, ReadSource
 from .nodes import And, BinOp, Cast, Cmp, Const, Field, Load, Node, Not, Or, PtrAdd, PtrConst, PtrSub, Reg
 from .types import POINTER, IntType, Pointer, PointerType, S64, U8, Value
 
@@ -51,13 +56,11 @@ _SHIFT_OPS = frozenset({"shl", "shr"})
 _CMP_OPS = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
 
 
-@dataclass(frozen=True)
-class ReadInterval:
-    """One memory region interval actually read during evaluation."""
-
-    region_id: str
-    offset: int
-    length: int
+ReadInterval = ReadSource
+"""Backwards-compatible alias: a successful read is evidenced by one
+``ReadInterval`` (== :class:`~debugexpr.memory.ReadSource`) per backing
+segment actually touched, so reads spanning multiple adjacent readable
+segments leave one precise source record per segment."""
 
 
 @dataclass(frozen=True)
@@ -224,14 +227,17 @@ def _do_load(ctx: _Ctx, ptr: Pointer, itype: IntType, path: tuple[str, ...]) -> 
             path,
         )
     if ptr.offset + size > region_size:
-        raise PointerError(
+        raise UnmappedAddressError(
             f"{itype} load at offset {ptr.offset} in region {ptr.region_id!r} "
-            f"needs {size} bytes but the region ends at {region_size} "
+            f"needs {size} bytes but the mapped extent ends at {region_size} "
             f"(one-past-end dereference is rejected)",
             path,
         )
-    raw = ctx.memory.read(ptr.region_id, ptr.offset, size)
-    ctx.reads.append(ReadInterval(ptr.region_id, ptr.offset, size))
+    # Atomic: resolve_read validates the whole interval (holes vs.
+    # non-readable pages) before returning any bytes, so a failure here
+    # produces neither a value nor read evidence.
+    raw, sources = ctx.memory.resolve_read(ptr.region_id, ptr.offset, size)
+    ctx.reads.extend(sources)
     return Value(itype, int.from_bytes(raw, "little", signed=itype.signed))
 
 

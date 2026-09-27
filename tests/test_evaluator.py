@@ -22,6 +22,7 @@ from debugexpr import (
     Field,
     InputError,
     Load,
+    MemorySegment,
     MemorySnapshot,
     NodeBudgetError,
     Not,
@@ -32,6 +33,7 @@ from debugexpr import (
     PtrConst,
     PtrSub,
     RangeError,
+    ReadPermissionError,
     Reg,
     ShiftError,
     TypeMismatchError,
@@ -43,6 +45,7 @@ from debugexpr import (
     U16,
     U32,
     U64,
+    UnmappedAddressError,
     evaluate,
 )
 from reference import ref_binop, ref_cast, ref_cmp
@@ -223,6 +226,142 @@ class TestPointers(unittest.TestCase):
         result = evaluate(Field(PtrConst("stack", 8), 8, U16), {}, STACK)
         self.assertEqual(result.value.data, 0x1110)
         self.assertEqual([(r.region_id, r.offset, r.length) for r in result.reads], [("stack", 16, 2)])
+
+
+def _segmented_snapshot():
+    # Region extent 44 with two readable segments, a guard page, holes:
+    # [0,8) readable (bytes 10..17), [8,16) unmapped hole,
+    # [16,24) readable (bytes 0..7), [24,32) mapped non-readable,
+    # [32,40) unmapped hole, [40,44) readable tail.
+    return MemorySnapshot(
+        {
+            "io": [
+                MemorySegment(0, bytes(range(10, 18)), True),
+                MemorySegment(16, bytes(range(8)), True),
+                MemorySegment(24, b"guard!!!", False),
+                MemorySegment(40, b"tail", True),
+            ]
+        }
+    )
+
+
+class TestSegmentedMemory(unittest.TestCase):
+    def test_region_extent_covers_gaps(self):
+        mem = _segmented_snapshot()
+        self.assertEqual(mem.region_size("io"), 44)
+
+    def test_pointer_into_hole_is_constructible_but_load_is_unmapped(self):
+        mem = _segmented_snapshot()
+        # offset 12 lies inside the mapped extent but in a hole
+        self.assertEqual(ev(PtrConst("io", 12), memory=mem).data, Pointer("io", 12))
+        with self.assertRaises(UnmappedAddressError):
+            ev(Load(PtrConst("io", 12), U8), memory=mem)
+
+    def test_load_inside_one_segment(self):
+        mem = _segmented_snapshot()
+        result = evaluate(Load(PtrConst("io", 16), U32), {}, mem)
+        self.assertEqual(result.value.data, 0x03020100)  # bytes 0..3 little-endian
+        self.assertEqual(
+            [(r.region_id, r.offset, r.length) for r in result.reads], [("io", 16, 4)]
+        )
+
+    def test_load_spanning_adjacent_segments_succeeds_with_full_provenance(self):
+        # Two adjacent readable segments with no hole: aligned u32 at
+        # offset 4 spans [4,6) of segment A and [6,8) of segment B.
+        mem = MemorySnapshot(
+            {
+                "io": [
+                    MemorySegment(0, b"\xaa\xbb\xcc\xdd\xee\xff", True),
+                    MemorySegment(6, b"\x01\x02\x03\x04", True),
+                ]
+            }
+        )
+        result = evaluate(Load(PtrConst("io", 4), U32), {}, mem)
+        self.assertEqual(result.value.data, 0x0201FFEE)
+        self.assertEqual(
+            [(r.region_id, r.offset, r.length) for r in result.reads],
+            [("io", 4, 2), ("io", 6, 2)],
+        )
+
+    def test_load_crossing_hole_fails_atomically(self):
+        mem = _segmented_snapshot()
+        # u32 at offset 8 starts in the [8,16) hole; no value.
+        with self.assertRaises(UnmappedAddressError):
+            evaluate(Load(PtrConst("io", 8), U32), {}, mem)
+
+    def test_load_touching_non_readable_segment_is_distinct_error(self):
+        mem = _segmented_snapshot()
+        with self.assertRaises(ReadPermissionError):
+            ev(Load(PtrConst("io", 24), U8), memory=mem)
+        # an interval partially entering the protected interval fails whole
+        # at the memory layer (alignment is checked by the evaluator first,
+        # so exercise the atomic boundary directly):
+        with self.assertRaises(ReadPermissionError):
+            mem.resolve_read("io", 22, 4)
+        # and stays a PointerError like every address-space violation
+        self.assertTrue(issubclass(ReadPermissionError, PointerError))
+        self.assertTrue(issubclass(UnmappedAddressError, PointerError))
+
+    def test_load_past_extent_is_unmapped(self):
+        mem = _segmented_snapshot()
+        # offset 31 starts in the non-readable guard [24,32)
+        with self.assertRaises(ReadPermissionError):
+            ev(Load(PtrConst("io", 30), U16), memory=mem)
+        # u16 at 38 sits inside the unmapped hole [32,40)
+        with self.assertRaises(UnmappedAddressError):
+            ev(Load(PtrConst("io", 38), U16), memory=mem)
+        # u8 at 44 is one past the mapped extent 44
+        with self.assertRaises(UnmappedAddressError):
+            ev(Load(PtrConst("io", 44), U8), memory=mem)
+
+    def test_failed_load_leaves_no_partial_evidence(self):
+        mem = _segmented_snapshot()
+        # A failing read returns nothing at the snapshot level (atomicity):
+        # no bytes tuple and therefore nothing to record as evidence.
+        with self.assertRaises(ReadPermissionError):
+            mem.resolve_read("io", 22, 4)
+        with self.assertRaises(UnmappedAddressError):
+            mem.resolve_read("io", 8, 2)
+
+    def test_successful_then_failed_load_discards_all_evidence(self):
+        mem = _segmented_snapshot()
+        # Both operands evaluate: first load succeeds, second hits a hole,
+        # so the whole expression raises; no EvalResult/reads are returned.
+        expr = BinOp(
+            "add",
+            Load(PtrConst("io", 16), U8),
+            Load(PtrConst("io", 14), U8),
+        )
+        with self.assertRaises(UnmappedAddressError):
+            evaluate(expr, {}, mem)
+
+    def test_short_circuit_skips_hole_and_protected_loads(self):
+        mem = _segmented_snapshot()
+        bad_hole = Load(PtrConst("io", 12), U8)
+        bad_prot = Load(PtrConst("io", 24), U8)
+        result = evaluate(And(Const(0, U8), bad_hole), {}, mem)
+        self.assertEqual(result.value.data, 0)
+        self.assertEqual(result.reads, ())
+        result = evaluate(Or(Const(1, U8), bad_prot), {}, mem)
+        self.assertEqual(result.value.data, 1)
+        self.assertEqual(result.reads, ())
+        # executed branches do raise the specific errors
+        with self.assertRaises(UnmappedAddressError):
+            evaluate(And(Const(1, U8), bad_hole), {}, mem)
+        with self.assertRaises(ReadPermissionError):
+            evaluate(Or(Const(0, U8), bad_prot), {}, mem)
+
+    def test_overlapping_segments_rejected(self):
+        with self.assertRaises(InputError):
+            MemorySnapshot(
+                {"io": [MemorySegment(0, b"abcd"), MemorySegment(2, b"efgh")]}
+            )
+
+    def test_flat_bytes_region_still_works(self):
+        mem = MemorySnapshot({"stack": bytes(range(8))})
+        self.assertEqual(
+            [(s.offset, s.readable) for s in mem.segments("stack")], [(0, True)]
+        )
 
 
 class TestRegisters(unittest.TestCase):

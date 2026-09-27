@@ -18,12 +18,14 @@ from .errors import (
     InputError,
     NodeBudgetError,
     PointerError,
+    ReadPermissionError,
     RangeError,
     ShiftError,
     TypeMismatchError,
+    UnmappedAddressError,
 )
 from .evaluator import MAX_NODES, EvalResult, ReadInterval, evaluate
-from .memory import MemorySnapshot
+from .memory import MemorySegment, MemorySnapshot, ReadSource
 from .nodes import And, BinOp, Cast, Cmp, Const, Field, Load, Node, Not, Or, PtrAdd, PtrConst, PtrSub, Reg
 from .types import (
     POINTER,
@@ -46,7 +48,9 @@ __all__ = [
     "MAX_NODES",
     "EvalResult",
     "ReadInterval",
+    "ReadSource",
     "MemorySnapshot",
+    "MemorySegment",
     "Node",
     "Const",
     "PtrConst",
@@ -81,5 +85,7 @@ __all__ = [
     "ShiftError",
     "DivisionByZeroError",
     "PointerError",
+    "UnmappedAddressError",
+    "ReadPermissionError",
     "NodeBudgetError",
 ]

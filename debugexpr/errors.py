@@ -64,5 +64,17 @@ class PointerError(EvalError):
     """
 
 
+class UnmappedAddressError(PointerError):
+    """A load touches an address hole: no segment is mapped there at all.
+
+    Distinct from :class:`ReadPermissionError`: the address is absent from
+    the address-space mapping rather than present but protected.
+    """
+
+
+class ReadPermissionError(PointerError):
+    """A load touches a segment that is mapped without read permission."""
+
+
 class NodeBudgetError(EvalError):
     """The AST exceeds the maximum allowed node count."""
