@@ -64,5 +64,23 @@ class PointerError(EvalError):
     """
 
 
+class UnmappedAddressError(PointerError):
+    """Load reaches an address with no mapped segment (a gap/hole).
+
+    Distinct from UnreadableMemoryError: the address is absent from the
+    address space rather than present but permission-denied.  It still
+    subclasses PointerError so callers catching address-space failures
+    keep working.
+    """
+
+
+class UnreadableMemoryError(PointerError):
+    """Load reaches a mapped segment without the read permission bit.
+
+    The address exists in the address space (it is not a hole), but the
+    backing segment was constructed with readable=False.
+    """
+
+
 class NodeBudgetError(EvalError):
     """The AST exceeds the maximum allowed node count."""

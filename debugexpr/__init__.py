@@ -6,10 +6,12 @@ Public API:
 * AST nodes: Const, PtrConst, Reg, BinOp, Cmp, Cast, PtrAdd, PtrSub,
   Load, Field, And, Or, Not
 * Types: IntType (or U8..U64 / S8..S64), POINTER, Pointer, Value
-* Memory: MemorySnapshot
+* Memory: MemorySnapshot, MemorySegment (multi-segment readable mappings)
 * Results: EvalResult, ReadInterval
 * Errors: EvalError and subclasses, each carrying a locatable ``path``
 * Limit: MAX_NODES
+* UnmappedAddressError / UnreadableMemoryError distinguish unmapped holes
+  from mapped-but-unreadable bytes
 """
 
 from .errors import (
@@ -21,9 +23,12 @@ from .errors import (
     RangeError,
     ShiftError,
     TypeMismatchError,
+    UnmappedAddressError,
+    UnreadableMemoryError,
 )
 from .evaluator import MAX_NODES, EvalResult, ReadInterval, evaluate
 from .memory import MemorySnapshot
+from .memory import MemorySegment
 from .nodes import And, BinOp, Cast, Cmp, Const, Field, Load, Node, Not, Or, PtrAdd, PtrConst, PtrSub, Reg
 from .types import (
     POINTER,
@@ -47,6 +52,7 @@ __all__ = [
     "EvalResult",
     "ReadInterval",
     "MemorySnapshot",
+    "MemorySegment",
     "Node",
     "Const",
     "PtrConst",
@@ -81,5 +87,7 @@ __all__ = [
     "ShiftError",
     "DivisionByZeroError",
     "PointerError",
+    "UnmappedAddressError",
+    "UnreadableMemoryError",
     "NodeBudgetError",
 ]

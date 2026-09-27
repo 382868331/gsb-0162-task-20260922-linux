@@ -16,9 +16,12 @@ Semantics (fixed contract, see README):
 * ``and``/``or`` short-circuit: the right operand is not evaluated when
   the left decides the result (so its side conditions, e.g. loads, never
   trigger).
-* Loads are little-endian, must be naturally aligned, and may only touch
-  regions of the snapshot passed to ``evaluate``.  Dereferencing the
-  one-past-end position is rejected.
+* Loads are little-endian and must be naturally aligned.  Each region is a
+  multi-segment mapping with read permissions: a load may cross adjacent
+  readable segments, but if any byte lands on an unmapped hole or on a
+  mapped-but-unreadable segment the whole load fails atomically (no value
+  and no read record is produced).  Dereferencing the one-past-end
+  position is rejected.
 * The AST is limited to ``MAX_NODES`` distinct nodes.
 
 Every contract violation raises an ``EvalError`` subclass carrying a
@@ -39,6 +42,7 @@ from .errors import (
     RangeError,
     ShiftError,
     TypeMismatchError,
+    UnmappedAddressError,
 )
 from .memory import MemorySnapshot
 from .nodes import And, BinOp, Cast, Cmp, Const, Field, Load, Node, Not, Or, PtrAdd, PtrConst, PtrSub, Reg
@@ -53,7 +57,12 @@ _CMP_OPS = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
 
 @dataclass(frozen=True)
 class ReadInterval:
-    """One memory region interval actually read during evaluation."""
+    """One contiguous, readable segment interval actually read.
+
+    A single aligned load spanning adjacent readable segments yields one
+    ReadInterval per segment touched (ascending offsets), keeping the
+    provenance exact inside multi-segment regions.
+    """
 
     region_id: str
     offset: int
@@ -224,14 +233,17 @@ def _do_load(ctx: _Ctx, ptr: Pointer, itype: IntType, path: tuple[str, ...]) -> 
             path,
         )
     if ptr.offset + size > region_size:
-        raise PointerError(
+        raise UnmappedAddressError(
             f"{itype} load at offset {ptr.offset} in region {ptr.region_id!r} "
             f"needs {size} bytes but the region ends at {region_size} "
             f"(one-past-end dereference is rejected)",
             path,
         )
-    raw = ctx.memory.read(ptr.region_id, ptr.offset, size)
-    ctx.reads.append(ReadInterval(ptr.region_id, ptr.offset, size))
+    # Atomic: every byte must be mapped and readable, otherwise this raises
+    # and nothing is recorded (a load never returns or records half a value).
+    raw, sources = ctx.memory.access(ptr.region_id, ptr.offset, size)
+    for source_offset, source_length in sources:
+        ctx.reads.append(ReadInterval(ptr.region_id, source_offset, source_length))
     return Value(itype, int.from_bytes(raw, "little", signed=itype.signed))
 
 
